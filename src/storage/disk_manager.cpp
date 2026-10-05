@@ -4,8 +4,10 @@
 #include "storage/disk_manager.h"
 
 #include <assert.h>    // for assert
+#include <fcntl.h>     // 提供 open() 函数和 O_CREAT, O_RDWR 等宏
 #include <sys/stat.h>  // for stat
 #include <unistd.h>    // for lseek
+#include <unistd.h>    // 提供 close(), read(), write(), lseek() 等函数
 
 #include <algorithm>
 #include <filesystem>
@@ -27,10 +29,16 @@ DiskManager::DiskManager() = default;
  * @param {int} num_bytes 要写入磁盘的数据大小
  */
 void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int num_bytes) {
-    // Todo:
-    // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
-    // 2.调用write()函数
-    // 注意write返回值与num_bytes不等时 throw InternalError("DiskManager::write_page Error");
+    off_t page_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
+    if (lseek(fd, page_offset, SEEK_SET) == -1) {
+        throw UnixError();
+    }
+
+    // 2. 写入数据
+    ssize_t bytes_written = write(fd, offset, num_bytes);
+    if (bytes_written != num_bytes) {
+        throw InternalError("DiskManager::write_page Error");
+    }
 }
 
 /**
@@ -41,10 +49,16 @@ void DiskManager::write_page(int fd, page_id_t page_no, const char* offset, int 
  * @param {int} num_bytes 读取的数据量大小
  */
 void DiskManager::read_page(int fd, page_id_t page_no, char* offset, int num_bytes) {
-    // Todo:
-    // 1.lseek()定位到文件头，通过(fd,page_no)可以定位指定页面及其在磁盘文件中的偏移量
-    // 2.调用read()函数
-    // 注意read返回值与num_bytes不等时，throw InternalError("DiskManager::read_page Error");
+    off_t page_offset = static_cast<off_t>(page_no) * PAGE_SIZE;
+    if (lseek(fd, page_offset, SEEK_SET) == -1) {
+        throw UnixError();
+    }
+
+    // 2. 读取数据
+    ssize_t bytes_read = read(fd, offset, num_bytes);
+    if (bytes_read != num_bytes) {
+        throw InternalError("DiskManager::read_page Error");
+    }
 }
 
 /**
@@ -104,9 +118,21 @@ bool DiskManager::is_file(const std::string& path) {
  * @param {string} &path
  */
 void DiskManager::create_file(const std::string& path) {
-    // Todo:
-    // 调用open()函数，使用O_CREAT模式
-    // 注意不能重复创建相同文件
+    // 检查文件是否已存在，不能重复创建
+    if (is_file(path)) {
+        throw FileExistsError(path);
+    }
+
+    // 使用 O_CREAT 创建文件，权限设为 0644
+    int fd = open(path.c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        throw UnixError();
+    }
+
+    // 创建后立即关闭，避免占用文件描述符
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
 }
 
 /**
@@ -114,9 +140,20 @@ void DiskManager::create_file(const std::string& path) {
  * @param {string} &path 文件所在路径
  */
 void DiskManager::destroy_file(const std::string& path) {
-    // Todo:
-    // 调用unlink()函数
-    // 注意不能删除未关闭的文件
+    // 检查文件是否存在
+    if (!is_file(path)) {
+        throw FileNotFoundError(path);
+    }
+
+    // 检查文件是否处于打开状态，未关闭的文件不能删除
+    if (path2fd_.contains(path)) {
+        throw FileNotClosedError(path);
+    }
+
+    // 调用 unlink 删除文件
+    if (unlink(path.c_str()) != 0) {
+        throw UnixError();
+    }
 }
 
 /**
@@ -125,9 +162,36 @@ void DiskManager::destroy_file(const std::string& path) {
  * @param {string} &path 文件所在路径
  */
 int DiskManager::open_file(const std::string& path) {
-    // Todo:
-    // 调用open()函数，使用O_RDWR模式
-    // 注意不能重复打开相同文件，并且需要更新文件打开列表
+    // 检查文件是否已打开，不能重复打开
+    if (path2fd_.contains(path)) {
+        throw FileNotClosedError(path);
+    }
+
+    // 检查文件是否存在
+    if (!is_file(path)) {
+        throw FileNotFoundError(path);
+    }
+
+    // 打开文件
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) {
+        throw UnixError();
+    }
+
+    // 更新文件打开列表：记录 fd 和 path 的双向映射
+    fd2path_[fd] = path;
+    path2fd_[path] = fd;
+
+    // 初始化该文件的页面编号计数器
+    // 如果该文件之前被打开过并分配了页号，这里需要恢复之前的计数
+    // 可以通过文件大小来计算已存在的页数
+    int file_size = get_file_size(fd);
+    if (file_size < 0) {
+        throw UnixError();
+    }
+    fd2pageno_[fd] = static_cast<page_id_t>(file_size / PAGE_SIZE);
+
+    return fd;
     return -1;
 }
 
@@ -136,9 +200,21 @@ int DiskManager::open_file(const std::string& path) {
  * @param {int} fd 打开的文件的文件句柄
  */
 void DiskManager::close_file(int fd) {
-    // Todo:
-    // 调用close()函数
-    // 注意不能关闭未打开的文件，并且需要更新文件打开列表
+    // 检查 fd 是否有效且已打开
+    if (!fd2path_.contains(fd)) {
+        throw FileNotOpenError(fd);
+    }
+
+    // 关闭文件
+    if (close(fd) < 0) {
+        throw UnixError();
+    }
+
+    // 更新文件打开列表
+    std::string path = fd2path_[fd];
+    fd2path_.erase(fd);
+    path2fd_.erase(path);
+    fd2pageno_[fd] = 0;  // 重置该文件的页号计数器
 }
 
 /**
