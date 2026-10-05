@@ -48,9 +48,16 @@ void LRUReplacer::pin(frame_id_t frame_id) {
  * @param {frame_id_t} frame_id 取消固定的frame的id
  */
 void LRUReplacer::unpin(frame_id_t frame_id) {
-    // Todo:
-    //  支持并发锁
-    //  选择一个frame取消固定
+    std::scoped_lock lock{latch_};
+
+    // 如果该帧已经在 LRU 列表中，则不做任何操作
+    if (LRUhash_.find(frame_id) != LRUhash_.end()) {
+        return;
+    }
+
+    // 插入到链表头部，表示最近被使用
+    LRUlist_.push_front(frame_id);
+    LRUhash_[frame_id] = LRUlist_.begin();
 }
 
 /**
